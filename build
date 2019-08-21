@@ -71,7 +71,12 @@ TARGET=${TARGET:-}
 TARGET_FILE=${TARGET_FILE:-}
 BUILD_ARGS_OPT=$(env | awk '/BUILD_ARG_/ {gsub(/BUILD_ARG_/, "--build-arg "); printf "%s ",$0}')
 BUILD_ARGS_FILE=${BUILD_ARGS_FILE:-}
+CACHE_FS=$(cat /proc/mounts |grep '/tmp/build/[0-9a-z]*/cache' | cut -d" " -f 3)
 
+COPY_STATE=false
+if [ "$CACHE_FS" != "btrfs" ]; then
+  COPY_STATE=true
+fi
 
 tag_name=""
 if [ -n "$TAG_FILE" ]; then
@@ -117,10 +122,16 @@ else
   build_args="$BUILD_ARGS_OPT"
 fi
 
-
-if [ -d ./cache/state ]; then
-  progress "syncing cache to state"
-  rsync -a ./cache/state/ /scratch/state
+if [ "$COPY_STATE" = "true" ]; then
+  if [ -d ./cache/state ]; then
+    progress "syncing cache to state"
+    rsync -a ./cache/state/ /scratch/state
+  fi
+  mkdir -p /scratch/state
+  ln -f -s /scratch/state /s
+else
+  mkdir -p ./cache/state
+  ln -f -s $(pwd)/cache/state /s
 fi
 
 if [ -e ./cache/whiteouts ]; then
@@ -131,13 +142,13 @@ if [ -e ./cache/whiteouts ]; then
 fi
 
 progress "building"
-img build --no-console -s /scratch/state -t $REPOSITORY:$tag_name -f $DOCKERFILE $target_arg $build_args $CONTEXT
+img build --no-console -s /s -t $REPOSITORY:$tag_name -f $DOCKERFILE $target_arg $build_args $CONTEXT
 
 if [ -d ./cache ]; then
   progress "syncing state to cache"
 
   > ./cache/whiteouts
-  find /scratch/state -type c | while read device; do
+  find /s -type c | while read device; do
     types=$(stat -c '%t,%T' "$device")
     if [ "$types" = "0,0" ]; then
       echo "recording whiteout: $device"
@@ -148,7 +159,9 @@ if [ -d ./cache ]; then
     fi
   done
 
-  rsync -a /scratch/state/ ./cache/state
+  if [ "$COPY_STATE" = "true" ]; then
+    rsync -a /scratch/state/ ./cache/state
+  fi
 fi
 
 if ! [ -d ./image ] && ! [ -d ./rootfs ]; then
@@ -158,14 +171,14 @@ fi
 
 mkdir -p image
 progress "saving image"
-img save -s /scratch/state -o image/image.tar $REPOSITORY:$tag_name
+img save -s /s -o image/image.tar $REPOSITORY:$tag_name
 
 if [ -d ./rootfs ]; then
   progress "unpacking rootfs"
   imageConfig=$(tar -Oxf image/image.tar manifest.json | jq -r '.[0].Config')
   tar -Oxf image/image.tar $imageConfig | jq '{"user":.config.User,"env":.config.Env}' > ./rootfs/metadata.json
   RUNC_PATH=$(echo /tmp/img-runc*) # Can be removed once this is fixed https://github.com/genuinetools/img/issues/233
-  PATH=$RUNC_PATH:$PATH img unpack -s /scratch/state -o /scratch/rootfs $REPOSITORY:$tag_name
+  PATH=$RUNC_PATH:$PATH img unpack -s /s -o /scratch/rootfs $REPOSITORY:$tag_name
   # unpacking to a btrfs backed baggageclaim volume directly hangs, so we unpack to /scratch and copy
   rsync -a /scratch/rootfs/ ./rootfs/rootfs
 fi
